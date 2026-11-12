@@ -1,257 +1,208 @@
-"""우리 둘의 하루 — Streamlit 커플 다이어리.
-실행: streamlit run app.py
-Streamlit Cloud Secrets 설정 예시는 함께 제공된 안내를 참고하세요.
-데이터는 GITHUB_DATA_REPO(반드시 비공개)의 DATA_PATH에 자동 생성됩니다.
-"""
-import base64
-import copy
-import hmac
-import io
-import json
-import time
-import uuid
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
-import qrcode
-import requests
 import streamlit as st
+import pandas as pd
+import plotly.express as px
+from datetime import date, datetime, timedelta
 
-st.set_page_config(page_title="우리 둘의 하루", page_icon="💌", layout="centered", initial_sidebar_state="collapsed")
-st.markdown("""<style>
-.block-container{max-width:460px;padding:1rem .9rem .5rem!important;}
-header[data-testid="stHeader"]{display:none;}
-[data-testid="stVerticalBlock"]{gap:.38rem;}
-[data-testid="stHeadingWithActionElements"]{margin:0;}
-h3{padding:.15rem 0!important;font-size:1.3rem!important;}
-p{margin-bottom:.25rem!important;}
-[data-testid="stCaptionContainer"]{font-size:.75rem;}
-.stButton button,.stDownloadButton button{min-height:2.25rem;}
-[data-testid="stTextArea"] textarea{font-size:16px;}
-[data-testid="stSelectbox"] input,[data-testid="stTextInput"] input{font-size:16px;}
-.stApp{background:linear-gradient(160deg,#fff8fa,#faf8ff);}
-[data-testid="stForm"]{border:1px solid #f0dce5;border-radius:16px;padding:.65rem;}
-@media(max-width:480px){.block-container{padding-top:.6rem!important;} [data-testid="stHorizontalBlock"]{gap:.4rem;}}
-</style>""", unsafe_allow_html=True)
+st.set_page_config(
+    page_title="스마트팜 작물 성장 모니터링",
+    page_icon="🌱",
+    layout="wide",
+)
 
-KST = ZoneInfo("Asia/Seoul")
-MOODS = ["😊 행복", "🥰 설렘", "😌 평온", "😢 슬픔", "😮‍💨 지침", "😤 속상"]
+# -----------------------------
+# 기본 설정 및 샘플 데이터
+# -----------------------------
+CROP_INFO = {
+    "토마토": {"temp": (18, 28), "humidity": (55, 75), "light": (6, 10), "days": 90},
+    "딸기": {"temp": (15, 25), "humidity": (60, 80), "light": (6, 10), "days": 120},
+    "상추": {"temp": (15, 22), "humidity": (50, 70), "light": (4, 8), "days": 45},
+    "파프리카": {"temp": (20, 28), "humidity": (60, 80), "light": (6, 10), "days": 100},
+}
 
-
-def setting(key, default=""):
-    return str(st.secrets.get(key, default)).strip()
-
-
-try:
-    TOKEN = setting("GITHUB_TOKEN")
-    REPO = setting("GITHUB_DATA_REPO")
-    PATH = setting("DATA_PATH", "couple_diary.json").strip("/")
-    PUBLIC_URL = setting("APP_URL")
-    NAMES = {"a": setting("PARTNER_1_NAME", "나무"), "b": setting("PARTNER_2_NAME", "하늘")}
-    PASSWORDS = {"a": setting("PARTNER_1_PASSWORD"), "b": setting("PARTNER_2_PASSWORD")}
-except Exception:
-    st.error("먼저 Streamlit 앱 설정의 Secrets를 입력해 주세요. 제공된 설치 안내를 확인하세요.")
-    st.stop()
-
-if not TOKEN or REPO.count("/") != 1 or not all(PASSWORDS.values()):
-    st.error("Secrets에 GITHUB_TOKEN, GITHUB_DATA_REPO, 두 사람의 비밀번호가 필요합니다.")
-    st.stop()
-if PASSWORDS["a"] == PASSWORDS["b"] or min(map(len, PASSWORDS.values())) < 12:
-    st.error("각자의 비밀번호를 서로 다르게, 각각 12자 이상으로 설정하세요.")
-    st.stop()
-
-HEADERS = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
-API = f"https://api.github.com/repos/{REPO}"
+STAGES = {
+    "토마토": [(0, "정식/활착"), (15, "생장기"), (40, "개화기"), (55, "착과기"), (75, "수확기")],
+    "딸기": [(0, "정식/활착"), (20, "생장기"), (50, "개화기"), (70, "착과기"), (95, "수확기")],
+    "상추": [(0, "정식/활착"), (7, "생장기"), (25, "결구기"), (35, "수확 준비")],
+    "파프리카": [(0, "정식/활착"), (20, "생장기"), (45, "개화기"), (65, "착과기"), (85, "수확기")],
+}
 
 
-class StorageError(Exception):
-    pass
+def stage_for(crop, elapsed_days):
+    stage = STAGES[crop][0][1]
+    for day_mark, name in STAGES[crop]:
+        if elapsed_days >= day_mark:
+            stage = name
+    return stage
 
 
-def api(method, url, **kwargs):
-    try:
-        return requests.request(method, url, headers=HEADERS, timeout=20, **kwargs)
-    except requests.RequestException:
-        raise StorageError("저장소에 연결하지 못했어요. 잠시 후 다시 시도해 주세요.") from None
+def make_sample_data():
+    now = datetime.now()
+    dates = pd.date_range(end=now, periods=24, freq="h")
+    rows = []
+    for i, ts in enumerate(dates):
+        # 화면 시연을 위한 예시 센서 데이터입니다.
+        rows.append({
+            "측정 시각": ts,
+            "온도(℃)": round(22 + 3 * __import__("math").sin(i / 3.5), 1),
+            "습도(%)": round(66 + 8 * __import__("math").sin(i / 4.2 + 1), 1),
+            "조도(시간)": round(7.5 + 1.2 * __import__("math").sin(i / 5), 1),
+            "토양 수분(%)": round(48 + 6 * __import__("math").sin(i / 4 + 2), 1),
+        })
+    return pd.DataFrame(rows)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def check_private(repo, _token):
-    # 공개 저장소에 개인 일기를 실수로 저장하지 못하도록 차단합니다.
-    response = api("GET", f"https://api.github.com/repos/{repo}")
-    if response.status_code != 200:
-        raise StorageError("저장소 접근 실패: 저장소 이름과 토큰의 Contents 읽기/쓰기 권한을 확인하세요.")
-    if not response.json().get("private"):
-        raise StorageError("일기는 반드시 비공개(Private) 저장소에 저장해야 합니다.")
-    return True
+if "sensor_data" not in st.session_state:
+    st.session_state.sensor_data = make_sample_data()
+if "growth_log" not in st.session_state:
+    st.session_state.growth_log = []
 
+# -----------------------------
+# 사이드바
+# -----------------------------
+st.sidebar.title("🌿 스마트팜 관리")
+st.sidebar.caption("작물 생육 및 환경 모니터링")
 
-def read_data():
-    response = api("GET", f"{API}/contents/{PATH}", params={"_": time.time_ns()})
-    if response.status_code == 404:
-        return {"version": 1, "entries": []}, None
-    if response.status_code != 200:
-        raise StorageError("일기를 불러오지 못했어요. 토큰 권한 또는 GitHub 사용 제한을 확인하세요.")
-    try:
-        body = response.json()
-        data = json.loads(base64.b64decode(body["content"]).decode("utf-8"))
-        if data.get("version") != 1 or not isinstance(data.get("entries"), list):
-            raise ValueError
-        return data, body["sha"]
-    except (ValueError, KeyError, TypeError):
-        raise StorageError("저장 파일 형식을 읽을 수 없어요. 기존 데이터는 덮어쓰지 않았습니다.") from None
+farm_name = st.sidebar.text_input("농장 이름", "우리 스마트팜")
+crop = st.sidebar.selectbox("재배 작물", list(CROP_INFO.keys()))
+planting_date = st.sidebar.date_input("정식일", date.today() - timedelta(days=35))
+area = st.sidebar.number_input("재배 면적 (㎡)", min_value=1.0, value=100.0, step=10.0)
 
+elapsed_days = max(0, (date.today() - planting_date).days)
+crop_info = CROP_INFO[crop]
+growth_stage = stage_for(crop, elapsed_days)
+progress = min(100, int(elapsed_days / crop_info["days"] * 100))
 
-def update_data(transform):
-    # 매 시도마다 최신 내용을 읽고 병합합니다. SHA 충돌 시 다시 시도합니다.
-    for attempt in range(4):
-        current, sha = read_data()
-        updated = transform(copy.deepcopy(current))
-        if updated == current:
-            return
-        content = base64.b64encode(json.dumps(updated, ensure_ascii=False, indent=2).encode()).decode()
-        payload = {"message": "Update shared diary", "content": content}
-        if sha:
-            payload["sha"] = sha
-        response = api("PUT", f"{API}/contents/{PATH}", json=payload)
-        if response.status_code in (200, 201):
-            return
-        if response.status_code in (409, 422):
-            time.sleep(.3 * (attempt + 1))
-            continue
-        raise StorageError("저장하지 못했어요. 토큰의 Contents 쓰기 권한을 확인하고 다시 시도하세요.")
-    raise StorageError("두 사람이 동시에 저장 중이에요. 잠시 후 다시 눌러 주세요.")
+st.title("🌱 작물 성장 상태 모니터링")
+st.caption(f"{farm_name} · {date.today().strftime('%Y년 %m월 %d일')} 기준")
+st.info("현재 화면은 예시 데이터로 작동합니다. 실제 온습도·조도 센서와 연결하려면 센서 또는 서버에서 받은 값을 입력/연동해야 합니다.")
 
+# -----------------------------
+# 현재 센서 상태
+# -----------------------------
+latest = st.session_state.sensor_data.iloc[-1]
+temp = float(latest["온도(℃)"])
+humidity = float(latest["습도(%)"])
+light = float(latest["조도(시간)"])
+soil = float(latest["토양 수분(%)"])
 
-def timestamp():
-    return datetime.now(KST).isoformat(timespec="seconds")
+temp_ok = crop_info["temp"][0] <= temp <= crop_info["temp"][1]
+humidity_ok = crop_info["humidity"][0] <= humidity <= crop_info["humidity"][1]
+light_ok = crop_info["light"][0] <= light <= crop_info["light"][1]
+soil_ok = 35 <= soil <= 65
+ok_count = sum([temp_ok, humidity_ok, light_ok, soil_ok])
+if ok_count == 4:
+    overall = "양호"
+    status_color = "green"
+elif ok_count >= 2:
+    overall = "주의"
+    status_color = "orange"
+else:
+    overall = "점검 필요"
+    status_color = "red"
 
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("현재 온도", f"{temp:.1f} ℃", "적정" if temp_ok else "확인 필요")
+m2.metric("현재 습도", f"{humidity:.1f} %", "적정" if humidity_ok else "확인 필요")
+m3.metric("일일 조도", f"{light:.1f} 시간", "적정" if light_ok else "확인 필요")
+m4.metric("토양 수분", f"{soil:.1f} %", "적정" if soil_ok else "확인 필요")
 
-def short_date(value):
-    return datetime.fromisoformat(value).astimezone(KST).strftime("%m/%d %H:%M")
+left, right = st.columns([1.3, 1])
+with left:
+    st.subheader("작물 성장 정보")
+    st.markdown(f"### {crop} · {growth_stage}")
+    st.progress(progress / 100, text=f"예상 재배 기간 진행률 {progress}%")
+    st.write(f"- 정식 후 경과: **{elapsed_days}일**")
+    st.write(f"- 참고 재배 기간: **약 {crop_info['days']}일**")
+    st.write(f"- 재배 면적: **{area:,.1f}㎡**")
+    st.write(f"- 생육 상태 종합: **:{status_color}[{overall}]**")
+with right:
+    st.subheader("생육 환경 적정 범위")
+    ranges = pd.DataFrame([
+        ["온도", f"{crop_info['temp'][0]}~{crop_info['temp'][1]} ℃", "적정" if temp_ok else "확인 필요"],
+        ["습도", f"{crop_info['humidity'][0]}~{crop_info['humidity'][1]} %", "적정" if humidity_ok else "확인 필요"],
+        ["조도", f"{crop_info['light'][0]}~{crop_info['light'][1]} 시간", "적정" if light_ok else "확인 필요"],
+        ["토양 수분", "35~65 % (기본 참고값)", "적정" if soil_ok else "확인 필요"],
+    ], columns=["항목", "참고 범위", "현재 판정"])
+    st.dataframe(ranges, hide_index=True, use_container_width=True)
 
+if overall != "양호":
+    st.warning("일부 환경 값이 작물별 참고 범위를 벗어났습니다. 센서 측정값과 재배 환경을 확인하세요.")
+else:
+    st.success("현재 입력된 환경 값은 설정한 참고 범위 안에 있습니다.")
 
-st.markdown("### 💌 우리 둘의 하루")
+st.divider()
 
-if "who" not in st.session_state:
-    st.caption("오늘의 기분과 짧은 마음을, 가장 가까운 사람에게.")
-    with st.form("login"):
-        person = st.selectbox("나는", ["a", "b"], format_func=lambda x: NAMES[x])
-        password = st.text_input("내 비밀번호", type="password")
-        enter = st.form_submit_button("우리 공간 열기", use_container_width=True)
-    if enter:
-        if hmac.compare_digest(password.encode(), PASSWORDS[person].encode()):
-            try:
-                check_private(REPO, TOKEN)
-            except StorageError as exc:
-                st.error(str(exc))
-            else:
-                st.session_state.who = person
-                st.rerun()
+# -----------------------------
+# 그래프
+# -----------------------------
+st.subheader("📈 최근 24시간 환경 변화")
+data = st.session_state.sensor_data.copy()
+selected_metric = st.selectbox(
+    "그래프로 확인할 항목",
+    ["온도(℃)", "습도(%)", "조도(시간)", "토양 수분(%)"],
+)
+fig = px.line(data, x="측정 시각", y=selected_metric, markers=True,
+              title=f"최근 측정 기록 - {selected_metric}")
+fig.update_layout(margin=dict(l=10, r=10, t=50, b=10), height=330)
+st.plotly_chart(fig, use_container_width=True)
+
+with st.expander("센서 측정 기록 보기"):
+    st.dataframe(data.sort_values("측정 시각", ascending=False), hide_index=True, use_container_width=True)
+    csv = data.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("측정 기록 CSV 다운로드", csv, "smartfarm_sensor_data.csv", "text/csv")
+
+# -----------------------------
+# 직접 센서값 입력 및 생육 일지
+# -----------------------------
+st.divider()
+st.subheader("🧪 센서값 직접 입력")
+st.caption("센서가 아직 연결되지 않았다면 아래에 측정값을 입력해 대시보드를 갱신할 수 있습니다.")
+with st.form("sensor_form"):
+    c1, c2, c3, c4 = st.columns(4)
+    new_temp = c1.number_input("온도 (℃)", min_value=-10.0, max_value=60.0, value=temp, step=0.1)
+    new_humidity = c2.number_input("습도 (%)", min_value=0.0, max_value=100.0, value=humidity, step=0.5)
+    new_light = c3.number_input("조도 (시간)", min_value=0.0, max_value=24.0, value=light, step=0.5)
+    new_soil = c4.number_input("토양 수분 (%)", min_value=0.0, max_value=100.0, value=soil, step=0.5)
+    submitted = st.form_submit_button("측정값 저장", type="primary")
+    if submitted:
+        new_row = pd.DataFrame([{
+            "측정 시각": datetime.now(),
+            "온도(℃)": new_temp,
+            "습도(%)": new_humidity,
+            "조도(시간)": new_light,
+            "토양 수분(%)": new_soil,
+        }])
+        st.session_state.sensor_data = pd.concat(
+            [st.session_state.sensor_data, new_row], ignore_index=True
+        ).tail(200)
+        st.success("새 측정값을 저장했습니다. 화면을 갱신해 확인하세요.")
+
+st.subheader("📝 생육 관찰 일지")
+with st.form("growth_form", clear_on_submit=True):
+    log_date = st.date_input("관찰 날짜", date.today(), key="log_date")
+    observation = st.text_area("관찰 내용", placeholder="예: 잎의 색이 진해짐, 꽃이 피기 시작함 등")
+    memo = st.text_input("메모 (선택)")
+    log_submitted = st.form_submit_button("일지 등록")
+    if log_submitted:
+        if observation.strip():
+            st.session_state.growth_log.append({
+                "날짜": log_date,
+                "작물": crop,
+                "생육 단계": growth_stage,
+                "관찰 내용": observation.strip(),
+                "메모": memo.strip(),
+            })
+            st.success("생육 관찰 일지를 등록했습니다.")
         else:
-            st.error("이름 또는 비밀번호를 확인해 주세요.")
-    st.caption("비밀번호는 주소나 QR에 포함되지 않아요.")
-    st.stop()
+            st.error("관찰 내용을 입력해 주세요.")
 
-ME = st.session_state.who
-OTHER = "b" if ME == "a" else "a"
+if st.session_state.growth_log:
+    logs = pd.DataFrame(st.session_state.growth_log)
+    st.dataframe(logs.sort_values("날짜", ascending=False), hide_index=True, use_container_width=True)
+    log_csv = logs.to_csv(index=False).encode("utf-8-sig")
+    st.download_button("생육 일지 CSV 다운로드", log_csv, "smartfarm_growth_log.csv", "text/csv")
+else:
+    st.caption("아직 등록된 생육 관찰 일지가 없습니다.")
 
-
-@st.fragment(run_every="30s")
-def diary():
-    try:
-        check_private(REPO, TOKEN)
-        data, _ = read_data()
-    except StorageError as exc:
-        st.error(str(exc))
-        st.button("다시 연결", on_click=st.rerun)
-        return
-
-    top = st.columns([6, 1, 1])
-    top[0].caption(f"{NAMES[ME]} → {NAMES[OTHER]} · 30초마다 새로고침")
-    if top[1].button("↻", help="지금 새로고침"):
-        st.rerun(scope="fragment")
-    with top[2].popover("⋯"):
-        st.caption("QR은 앱 주소만 담습니다. 상대방도 자신의 비밀번호로 로그인하세요.")
-        if PUBLIC_URL.startswith("https://"):
-            image = qrcode.make(PUBLIC_URL)
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG")
-            st.image(buffer.getvalue(), width=180)
-            st.download_button("QR 다운로드", buffer.getvalue(), "couple-diary-qr.png", "image/png")
-        else:
-            st.caption("배포 후 Secrets의 APP_URL에 https://로 시작하는 앱 주소를 입력하면 QR이 표시됩니다.")
-        if st.button("로그아웃", use_container_width=True):
-            st.session_state.clear()
-            st.rerun()
-
-    notice = st.session_state.pop("notice", None)
-    if notice:
-        st.caption(notice)
-
-    with st.form("write", clear_on_submit=True):
-        mood = st.selectbox("오늘 기분", MOODS, label_visibility="collapsed")
-        text = st.text_area("오늘의 마음", placeholder="오늘 너에게 전하고 싶은 이야기… (240자)", height=90, max_chars=240, label_visibility="collapsed")
-        send = st.form_submit_button("💌 마음 보내기", use_container_width=True)
-    if send:
-        if not text.strip():
-            st.warning("마음을 한 줄 적어 주세요.")
-        else:
-            # 세션에서 재시도할 때에도 동일한 ID를 사용해 중복 생성을 막습니다.
-            signature = (mood, text.strip())
-            pending = st.session_state.get("pending")
-            if not pending or pending["signature"] != signature:
-                pending = {"signature": signature, "entry": {"id": str(uuid.uuid4()), "author": ME, "mood": mood, "text": text.strip(), "created_at": timestamp(), "read_at": None}}
-                st.session_state.pending = pending
-            entry = pending["entry"]
-
-            def add(document):
-                if not any(x["id"] == entry["id"] for x in document["entries"]):
-                    document["entries"].append(entry)
-                return document
-
-            try:
-                update_data(add)
-            except StorageError as exc:
-                st.error(str(exc))
-            else:
-                st.session_state.pop("pending", None)
-                st.session_state.notice = "보냈어요 💗"
-                st.rerun(scope="fragment")
-
-    entries = sorted(data["entries"], key=lambda x: x["created_at"], reverse=True)
-    unread = sum(x["author"] == OTHER and not x.get("read_at") for x in entries)
-    st.caption(f"📬 우리 기록 · 안 읽은 마음 {unread}개")
-    if not entries:
-        st.info("아직 일기가 없어요. 첫 마음을 보내 보세요 💗")
-        return
-
-    def label(entry_id):
-        entry = next(x for x in entries if x["id"] == entry_id)
-        badge = "✓" if entry.get("read_at") else "●"
-        return f"{badge} {short_date(entry['created_at'])} · {NAMES[entry['author']]} · {entry['mood']}"
-
-    selected = st.selectbox("기록 선택", [x["id"] for x in entries], format_func=label, label_visibility="collapsed", key="selected_entry")
-    entry = next(x for x in entries if x["id"] == selected)
-    # 고정 높이로 긴 글이 화면 전체를 밀어내지 않습니다.
-    st.text_area("선택한 일기", value=entry["text"], height=105, disabled=True, label_visibility="collapsed", key=f"body_{selected}")
-    if entry["author"] == ME:
-        st.caption(f"✓ {NAMES[OTHER]} 확인 · {short_date(entry['read_at'])}" if entry.get("read_at") else f"아직 {NAMES[OTHER]}의 확인 전이에요 🌙")
-    elif entry.get("read_at"):
-        st.caption(f"✓ 내가 확인한 마음 · {short_date(entry['read_at'])}")
-    else:
-        if st.button("✓ 읽었어요 — 상대에게 알리기", use_container_width=True):
-            def mark(document):
-                for item in document["entries"]:
-                    if item["id"] == selected and item["author"] != ME and not item.get("read_at"):
-                        item["read_at"] = timestamp()
-                return document
-            try:
-                update_data(mark)
-            except StorageError as exc:
-                st.error(str(exc))
-            else:
-                st.rerun(scope="fragment")
-
-
-diary()
+st.divider()
+st.caption("※ 작물별 적정 환경과 재배 기간은 품종·시설·지역·생육 단계에 따라 달라질 수 있습니다. 본 앱의 수치는 시연용 참고값이며 농업 전문가의 재배 지침을 대체하지 않습니다.")
